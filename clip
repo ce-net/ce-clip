@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+# clip — shared clipboard across YOUR devices, over the CE mesh. No hub, no domain, no HTTP cheat:
+# the clipboard travels device->device through the local node's mesh transport (relay-routed through
+# NAT, Noise-encrypted), and is accepted only from devices you've linked with `ce-link` (the node
+# authenticates the sender; we authorize by checking it's a known peer).
+#
+#   clip serve     run on each machine (daemon): receive pushes + answer pulls
+#   clip           send THIS machine's clipboard (or piped stdin) to your linked devices
+#   clip p [peer]  pull a linked device's current clipboard into this machine's clipboard
+#
+# Talks only to the LOCAL node at 127.0.0.1:8844 (/mesh/send, /mesh/request, /mesh/messages,
+# /mesh/reply). Any language can be a mesh app this way — see ce-rs/ce-ts for the SDK version.
+
+import sys, os, json, time, subprocess, binascii, urllib.request, urllib.error
+
+NODE = os.environ.get("CE_NODE", "http://127.0.0.1:8844").rstrip("/")
+LINKS = os.path.expanduser("~/.config/ce-link/links.json")
+TOPIC_SET, TOPIC_GET = "clip/set", "clip/get"
+
+def links():
+    try: return json.load(open(LINKS))
+    except Exception: return []
+def peer_ids(): return {l["peerNodeId"] for l in links()}
+def peer_for(name):
+    for l in links():
+        if name in (l["peer"], l["peerNodeId"], l["peerNodeId"][:12]): return l["peerNodeId"]
+    return None
+
+def api_token():
+    # The node requires Authorization: Bearer <api.token> on mutating calls. Discover it like ce-rs:
+    # $CE_API_TOKEN first, then the platform data dir's api.token.
+    t = os.environ.get("CE_API_TOKEN")
+    if t: return t.strip()
+    for p in ("~/Library/Application Support/ce/api.token",   # macOS
+              "~/.local/share/ce/api.token",                   # Linux/XDG default
+              os.path.join(os.environ.get("XDG_DATA_HOME", "~/.local/share"), "ce/api.token")):
+        fp = os.path.expanduser(p)
+        if os.path.exists(fp):
+            try: return open(fp).read().strip()
+            except Exception: pass
+    return None
+
+def _headers(extra=None):
+    h = dict(extra or {})
+    t = api_token()
+    if t: h["Authorization"] = f"Bearer {t}"
+    return h
+
+def node_post(path, body):
+    req = urllib.request.Request(f"{NODE}/{path}", data=json.dumps(body).encode(),
+                                 headers=_headers({"Content-Type": "application/json"}), method="POST")
+    return urllib.request.urlopen(req, timeout=20).read()
+def node_get(path):
+    return urllib.request.urlopen(urllib.request.Request(f"{NODE}/{path}", headers=_headers()), timeout=20).read()
+def henc(b): return binascii.hexlify(b).decode()
+def hdec(s): return binascii.unhexlify(s) if s else b""
+
+def read_clip():
+    for cmd in (["pbpaste"], ["wl-paste", "-n"], ["xclip", "-selection", "clipboard", "-o"], ["xsel", "-b"]):
+        try: return subprocess.run(cmd, capture_output=True, text=True).stdout
+        except FileNotFoundError: continue
+    return None
+def write_clip(t):
+    for cmd in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-bi"]):
+        try: subprocess.run(cmd, input=t, text=True); return cmd[0]
+        except FileNotFoundError: continue
+    return None
+
+def cmd_copy():
+    t = sys.stdin.read() if not sys.stdin.isatty() else (read_clip() or "")
+    if not t: sys.exit("clip: nothing to send (empty clipboard / no clipboard tool — try: echo hi | clip)")
+    ids = peer_ids()
+    if not ids: sys.exit("clip: no linked devices yet — run `ce-link` to link a machine")
+    ph, n = henc(t.encode()), 0
+    for pid in ids:
+        try: node_post("mesh/send", {"to": pid, "topic": TOPIC_SET, "payload_hex": ph}); n += 1
+        except Exception as e: sys.stderr.write(f"  -> {pid[:12]}…: {e}\n")
+    sys.stderr.write(f"sent {len(t)} chars to {n} linked device(s) over the mesh (encrypted)\n")
+
+def cmd_paste():
+    ids = list(peer_ids())
+    if not ids: sys.exit("clip: no linked devices yet — run `ce-link`")
+    pid = (peer_for(sys.argv[2]) if len(sys.argv) > 2 else None) or ids[0]
+    try:
+        r = json.loads(node_post("mesh/request", {"to": pid, "topic": TOPIC_GET, "payload_hex": "", "timeout_ms": 15000}))
+    except urllib.error.HTTPError as e:
+        sys.exit(f"clip: pull failed ({e.code}). Is `clip serve` running on the other machine?")
+    t = hdec(r.get("payload_hex", "")).decode("utf-8", "replace")
+    where = write_clip(t); sys.stdout.write(t)
+    sys.stderr.write(f"\n(pulled from {pid[:12]}… over the mesh" + (f", set via {where}" if where else "") + ")\n")
+
+def cmd_serve():
+    sys.stderr.write(f"clip serve: listening for clip/* from linked devices via {NODE} (Ctrl-C to stop)\n")
+    last_set, replied = None, set()
+    while True:
+        try: msgs = json.loads(node_get("mesh/messages"))
+        except Exception: time.sleep(1); continue
+        allowed = peer_ids()
+        for m in msgs:
+            topic, frm, tok = m.get("topic", ""), m.get("from", ""), m.get("reply_token")
+            if not topic.startswith("clip/") or frm not in allowed:  # only linked devices
+                continue
+            if topic == TOPIC_SET:
+                ph = m.get("payload_hex", "")
+                if ph != last_set:                      # idempotent: only set on change
+                    write_clip(hdec(ph).decode("utf-8", "replace")); last_set = ph
+                    sys.stderr.write(f"clipboard set from {frm[:12]}…\n")
+            elif topic == TOPIC_GET and tok is not None and tok not in replied:
+                replied.add(tok)
+                node_post("mesh/reply", {"token": tok, "payload_hex": henc((read_clip() or "").encode())})
+        if len(replied) > 2000: replied = set(list(replied)[-500:])
+        time.sleep(0.4)
+
+op = sys.argv[1] if len(sys.argv) > 1 else "copy"
+{"serve": cmd_serve, "p": cmd_paste, "paste": cmd_paste, "get": cmd_paste}.get(op, cmd_copy)()
